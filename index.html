@@ -70,10 +70,15 @@
   </main>
   <input id="pick" type="file" accept="application/pdf,.pdf" multiple>
   <script type="module">
-    import * as pdfjs from "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs";
-
-    pdfjs.GlobalWorkerOptions.workerSrc =
-      "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs";
+    import {
+      PDFDocument,
+      PDFDict,
+      PDFArray,
+      PDFName,
+      PDFString,
+      PDFHexString,
+      PDFRef,
+    } from "https://cdn.jsdelivr.net/npm/@cantoo/pdf-lib@2.9.1/dist/pdf-lib.esm.min.js";
 
     const pick = document.getElementById("pick");
     const msg = document.getElementById("msg");
@@ -90,7 +95,7 @@
 
     function csvCell(value) {
       const s = value == null ? "" : String(value);
-      if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+      if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, "\"\"")}"`;
       return s;
     }
 
@@ -106,71 +111,117 @@
       URL.revokeObjectURL(url);
     }
 
-
-    function stringifyValue(value) {
-      if (value == null) return "";
-      if (Array.isArray(value)) {
-        return value.map((v) => (v == null ? "" : String(v))).filter(Boolean).join(", ");
-      }
-      return String(value);
-    }
-
     function isPasswordError(err) {
       if (!err) return false;
-      if (typeof pdfjs.PasswordException === "function" && err instanceof pdfjs.PasswordException) {
-        return true;
-      }
-      return err.name === "PasswordException";
+      const name = err.name || "";
+      const text = String(err.message || err);
+      return (
+        name === "EncryptedPDFError" ||
+        name === "PasswordException" ||
+        /password/i.test(text) ||
+        /encrypted/i.test(text)
+      );
     }
 
-    async function fieldsFromObjects(doc) {
-      const fieldObjects = await doc.getFieldObjects();
-      if (!fieldObjects) return null;
-      const names = Object.keys(fieldObjects);
-      if (!names.length) return null;
-      const values = {};
-      for (const name of names) {
-        const entries = fieldObjects[name];
-        const raw = entries && entries[0] ? entries[0].value : "";
-        values[name] = stringifyValue(raw);
+    function deref(obj, context) {
+      if (obj instanceof PDFRef) {
+        try { return context.lookup(obj); } catch (_) { return undefined; }
       }
-      return { names, values };
+      return obj;
     }
 
-    async function fieldsFromAnnotations(doc) {
-      const names = [];
-      const values = {};
-      for (let i = 1; i <= doc.numPages; i++) {
-        const page = await doc.getPage(i);
-        const annots = await page.getAnnotations({ intent: "display" });
-        for (const annot of annots) {
-          if (!annot || annot.subtype !== "Widget") continue;
-          const name = annot.fieldName;
-          if (!name || Object.prototype.hasOwnProperty.call(values, name)) continue;
-          const raw = annot.fieldValue != null ? annot.fieldValue : annot.buttonValue;
-          names.push(name);
-          values[name] = stringifyValue(raw);
+    function asDict(obj, context) {
+      const value = deref(obj, context);
+      return value instanceof PDFDict ? value : null;
+    }
+
+    function cleanText(value) {
+      return String(value || "").replace(/\r\n|\r|\n/g, " ").trim();
+    }
+
+    function decodePDFObject(obj, context) {
+      if (obj == null) return "";
+      obj = deref(obj, context);
+      if (obj == null) return "";
+      if (obj instanceof PDFString || obj instanceof PDFHexString) {
+        try { return obj.decodeText(); } catch (_) {}
+        try { return obj.asString(); } catch (_) {}
+        return "";
+      }
+      if (obj instanceof PDFName) {
+        try {
+          if (typeof obj.decodeText === "function") return obj.decodeText();
+        } catch (_) {}
+        const s = obj.asString();
+        return s.charAt(0) === "/" ? s.slice(1) : s;
+      }
+      if (obj instanceof PDFArray) {
+        const parts = [];
+        for (let i = 0; i < obj.size(); i++) {
+          const piece = decodePDFObject(obj.lookup(i), context);
+          if (piece) parts.push(piece);
+        }
+        return parts.join(", ");
+      }
+      if (typeof obj.asBoolean === "function") {
+        try { return obj.asBoolean() ? "true" : "false"; } catch (_) {}
+      }
+      if (typeof obj.asNumber === "function") {
+        try { return String(obj.asNumber()); } catch (_) {}
+      }
+      return "";
+    }
+
+    function fieldValue(dict, context) {
+      if (!dict.has(PDFName.of("V"))) return "";
+      const raw = cleanText(decodePDFObject(dict.lookup(PDFName.of("V")), context));
+      if (!raw || raw === "Off" || raw === "/Off") return "";
+      return raw;
+    }
+
+    function collectFields(pdfDoc) {
+      const context = pdfDoc.context;
+      const acroForm = pdfDoc.catalog.lookupMaybe(PDFName.of("AcroForm"), PDFDict);
+      if (!acroForm) return [];
+      const fieldsArr = acroForm.lookupMaybe(PDFName.of("Fields"), PDFArray);
+      if (!fieldsArr) return [];
+      const out = [];
+      const seen = new Set();
+      function walk(node) {
+        const dict = asDict(node, context);
+        if (!dict || seen.has(dict)) return;
+        seen.add(dict);
+        const name = cleanText(decodePDFObject(dict.lookup(PDFName.of("T")), context));
+        if (name) {
+          const tu = dict.lookup(PDFName.of("TU"));
+          const label = tu ? (cleanText(decodePDFObject(tu, context)) || name) : name;
+          out.push({ name, label, value: fieldValue(dict, context) });
+        }
+        const kids = dict.lookupMaybe(PDFName.of("Kids"), PDFArray);
+        if (kids) {
+          for (let i = 0; i < kids.size(); i++) walk(kids.get(i));
         }
       }
-      if (!names.length) return null;
-      return { names, values };
+      for (let i = 0; i < fieldsArr.size(); i++) walk(fieldsArr.get(i));
+      return out;
+    }
+
+    function uniqueHeaders(fields) {
+      const counts = new Map();
+      for (const f of fields) counts.set(f.label, (counts.get(f.label) || 0) + 1);
+      return fields.map((f) => (counts.get(f.label) > 1 ? `${f.label} ${f.name}` : f.label));
     }
 
     async function readFields(file) {
-      const data = new Uint8Array(await file.arrayBuffer());
-      const loadingTask = pdfjs.getDocument({
-        data,
-        useSystemFonts: true,
-        isEvalSupported: false,
-      });
-      const doc = await loadingTask.promise;
-      try {
-        const fromObjects = await fieldsFromObjects(doc);
-        if (fromObjects) return fromObjects;
-        return await fieldsFromAnnotations(doc);
-      } finally {
-        try { await doc.destroy(); } catch (_) {}
-      }
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const pdfDoc = await PDFDocument.load(bytes, { ignoreEncryption: true, password: "" });
+      const fields = collectFields(pdfDoc);
+      if (!fields.length) return null;
+      const names = fields.map((f) => f.name);
+      const headers = uniqueHeaders(fields);
+      const values = {};
+      for (let i = 0; i < fields.length; i++) values[names[i]] = fields[i].value;
+      return { names, headers, values };
     }
 
     function namesKey(names) {
@@ -188,6 +239,7 @@
 
       const rows = [];
       let schema = null;
+      let headers = null;
       const errors = [];
 
       for (const file of files) {
@@ -211,14 +263,17 @@
         const names = extracted.names;
         if (!schema) {
           schema = names;
+          headers = extracted.headers;
         } else if (namesKey(names) !== namesKey(schema)) {
           errors.push("These aren't the same form. Use copies of one PDF.");
           continue;
         }
 
         const row = { file: file.name };
-        for (const name of schema) {
-          row[name] = Object.prototype.hasOwnProperty.call(extracted.values, name)
+        for (let i = 0; i < schema.length; i++) {
+          const name = schema[i];
+          const header = headers[i];
+          row[header] = Object.prototype.hasOwnProperty.call(extracted.values, name)
             ? extracted.values[name]
             : "";
         }
@@ -231,10 +286,10 @@
         return;
       }
 
-      const headers = ["file", ...schema];
-      const lines = [headers.map(csvCell).join(",")];
+      const csvHeaders = ["file", ...headers];
+      const lines = [csvHeaders.map(csvCell).join(",")];
       for (const row of rows) {
-        lines.push(headers.map((h) => csvCell(row[h] ?? "")).join(","));
+        lines.push(csvHeaders.map((h) => csvCell(row[h] ?? "")).join(","));
       }
       downloadCsv(lines.join("\r\n"));
       setMsg(`Downloaded responses.csv (${rows.length} rows). Drop more anytime.`, "ok");
