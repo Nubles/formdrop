@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FormDrop</title>
+  <style>
+    :root {
+      --bg: #f6f4ef;
+      --bg-drag: #efebe3;
+      --ink: #141414;
+      --muted: #5c5c5c;
+      --err: #b42318;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      min-height: 100%;
+      cursor: pointer;
+      -webkit-font-smoothing: antialiased;
+    }
+    body.drag { background: var(--bg-drag); }
+    main {
+      min-height: 100%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 3rem 1.5rem 4rem;
+      pointer-events: none;
+      gap: 0.85rem;
+    }
+    h1 {
+      font-size: clamp(1.75rem, 4vw, 2.5rem);
+      font-weight: 560;
+      letter-spacing: -0.035em;
+      line-height: 1.15;
+      margin: 0;
+    }
+    .lede {
+      margin: 0;
+      max-width: 28rem;
+      font-size: 1.05rem;
+      line-height: 1.5;
+      color: var(--muted);
+      font-weight: 400;
+    }
+    #msg {
+      margin: 1.1rem 0 0;
+      max-width: 32rem;
+      font-size: 1.05rem;
+      line-height: 1.45;
+      min-height: 1.5em;
+    }
+    #msg.ok { color: var(--ink); }
+    #msg.err { color: var(--err); }
+    #msg:empty { display: none; }
+    input { position: absolute; width: 0; height: 0; opacity: 0; pointer-events: none; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Drop filled PDFs</h1>
+    <p class="lede">Same form, many copies. Empty fields stay empty. Files never leave this page.</p>
+    <p id="msg"></p>
+  </main>
+  <input id="pick" type="file" accept="application/pdf,.pdf" multiple>
+  <script type="module">
+    import { PDFDocument } from "https://esm.sh/pdf-lib@1.17.1";
+
+    const pick = document.getElementById("pick");
+    const msg = document.getElementById("msg");
+
+    function setMsg(text, kind) {
+      msg.textContent = text || "";
+      msg.className = kind || "";
+    }
+
+    function isPdf(file) {
+      const name = (file.name || "").toLowerCase();
+      return file.type === "application/pdf" || name.endsWith(".pdf");
+    }
+
+    function csvCell(value) {
+      const s = value == null ? "" : String(value);
+      if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+      return s;
+    }
+
+    function downloadCsv(text) {
+      const blob = new Blob([text], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "responses.csv";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    function fieldValue(field) {
+      try {
+        if (typeof field.getText === "function") {
+          const t = field.getText();
+          return t == null ? "" : String(t);
+        }
+      } catch (_) {}
+      try {
+        if (typeof field.isChecked === "function") {
+          return field.isChecked() ? "Yes" : "";
+        }
+      } catch (_) {}
+      try {
+        if (typeof field.getSelected === "function") {
+          const s = field.getSelected();
+          if (Array.isArray(s)) return s.filter(Boolean).join(", ");
+          return s == null ? "" : String(s);
+        }
+      } catch (_) {}
+      return "";
+    }
+
+    function namesKey(names) {
+      return [...names].sort().join("\u0001");
+    }
+
+    async function handleFiles(fileList) {
+      const files = [...fileList];
+      if (!files.length) return;
+
+      if (files.some((f) => !isPdf(f))) {
+        setMsg("Only PDFs.", "err");
+        return;
+      }
+
+      const rows = [];
+      let schema = null;
+      const errors = [];
+
+      for (const file of files) {
+        let pdf;
+        try {
+          const bytes = await file.arrayBuffer();
+          pdf = await PDFDocument.load(bytes);
+        } catch (err) {
+          const m = String(err && err.message ? err.message : err).toLowerCase();
+          if (m.includes("encrypt") || m.includes("password") || m.includes("locked")) {
+            errors.push(`${file.name} is locked.`);
+          } else {
+            errors.push(`Couldn't read ${file.name}.`);
+          }
+          continue;
+        }
+
+        if (pdf.isEncrypted) {
+          errors.push(`${file.name} is locked.`);
+          continue;
+        }
+
+        let fields;
+        try {
+          fields = pdf.getForm().getFields();
+        } catch (err) {
+          const m = String(err && err.message ? err.message : err).toLowerCase();
+          if (m.includes("encrypt") || m.includes("password") || m.includes("locked")) {
+            errors.push(`${file.name} is locked.`);
+          } else {
+            errors.push(`${file.name} has no fillable fields.`);
+          }
+          continue;
+        }
+
+        if (!fields.length) {
+          errors.push(`${file.name} has no fillable fields.`);
+          continue;
+        }
+
+        const names = fields.map((f) => f.getName());
+        if (!schema) {
+          schema = names;
+        } else if (namesKey(names) !== namesKey(schema)) {
+          errors.push("These aren't the same form. Use copies of one PDF.");
+          continue;
+        }
+
+        const byName = new Map(fields.map((f) => [f.getName(), f]));
+        const row = { file: file.name };
+        for (const name of schema) {
+          const field = byName.get(name);
+          row[name] = field ? fieldValue(field) : "";
+        }
+        rows.push(row);
+      }
+
+      if (errors.length) {
+        const unique = [...new Set(errors)];
+        setMsg(unique.join(" "), "err");
+        return;
+      }
+
+      const headers = ["file", ...schema];
+      const lines = [headers.map(csvCell).join(",")];
+      for (const row of rows) {
+        lines.push(headers.map((h) => csvCell(row[h] ?? "")).join(","));
+      }
+      downloadCsv(lines.join("\r\n"));
+      setMsg(`Downloaded responses.csv (${rows.length} rows). Drop more anytime.`, "ok");
+    }
+
+    document.body.addEventListener("click", () => pick.click());
+    pick.addEventListener("click", (e) => e.stopPropagation());
+    pick.addEventListener("change", () => {
+      handleFiles(pick.files).catch(() => setMsg("Couldn't read the files.", "err"));
+      pick.value = "";
+    });
+
+    ["dragenter", "dragover"].forEach((type) => {
+      document.addEventListener(type, (e) => {
+        e.preventDefault();
+        document.body.classList.add("drag");
+      });
+    });
+    ["dragleave", "drop"].forEach((type) => {
+      document.addEventListener(type, (e) => {
+        e.preventDefault();
+        if (type === "dragleave" && e.target !== document.body) return;
+        document.body.classList.remove("drag");
+      });
+    });
+    document.addEventListener("drop", (e) => {
+      e.preventDefault();
+      document.body.classList.remove("drag");
+      handleFiles(e.dataTransfer.files).catch(() => setMsg("Couldn't read the files.", "err"));
+    });
+  </script>
+</body>
+</html>
