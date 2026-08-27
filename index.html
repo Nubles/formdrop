@@ -146,10 +146,10 @@
         let pdf;
         try {
           const bytes = await file.arrayBuffer();
-          pdf = await PDFDocument.load(bytes);
+          pdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
         } catch (err) {
           const m = String(err && err.message ? err.message : err).toLowerCase();
-          if (m.includes("encrypt") || m.includes("password") || m.includes("locked")) {
+          if (m.includes("password")) {
             errors.push(`${file.name} is locked.`);
           } else {
             errors.push(`Couldn't read ${file.name}.`);
@@ -157,21 +157,11 @@
           continue;
         }
 
-        if (pdf.isEncrypted) {
-          errors.push(`${file.name} is locked.`);
-          continue;
-        }
-
         let fields;
         try {
           fields = pdf.getForm().getFields();
         } catch (err) {
-          const m = String(err && err.message ? err.message : err).toLowerCase();
-          if (m.includes("encrypt") || m.includes("password") || m.includes("locked")) {
-            errors.push(`${file.name} is locked.`);
-          } else {
-            errors.push(`${file.name} has no fillable fields.`);
-          }
+          errors.push(`${file.name} has no fillable fields.`);
           continue;
         }
 
