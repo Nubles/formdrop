@@ -70,7 +70,10 @@
   </main>
   <input id="pick" type="file" accept="application/pdf,.pdf" multiple>
   <script type="module">
-    import { PDFDocument } from "https://esm.sh/pdf-lib@1.17.1";
+    import * as pdfjs from "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs";
+
+    pdfjs.GlobalWorkerOptions.workerSrc =
+      "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs";
 
     const pick = document.getElementById("pick");
     const msg = document.getElementById("msg");
@@ -103,26 +106,71 @@
       URL.revokeObjectURL(url);
     }
 
-    function fieldValue(field) {
-      try {
-        if (typeof field.getText === "function") {
-          const t = field.getText();
-          return t == null ? "" : String(t);
+
+    function stringifyValue(value) {
+      if (value == null) return "";
+      if (Array.isArray(value)) {
+        return value.map((v) => (v == null ? "" : String(v))).filter(Boolean).join(", ");
+      }
+      return String(value);
+    }
+
+    function isPasswordError(err) {
+      if (!err) return false;
+      if (typeof pdfjs.PasswordException === "function" && err instanceof pdfjs.PasswordException) {
+        return true;
+      }
+      return err.name === "PasswordException";
+    }
+
+    async function fieldsFromObjects(doc) {
+      const fieldObjects = await doc.getFieldObjects();
+      if (!fieldObjects) return null;
+      const names = Object.keys(fieldObjects);
+      if (!names.length) return null;
+      const values = {};
+      for (const name of names) {
+        const entries = fieldObjects[name];
+        const raw = entries && entries[0] ? entries[0].value : "";
+        values[name] = stringifyValue(raw);
+      }
+      return { names, values };
+    }
+
+    async function fieldsFromAnnotations(doc) {
+      const names = [];
+      const values = {};
+      for (let i = 1; i <= doc.numPages; i++) {
+        const page = await doc.getPage(i);
+        const annots = await page.getAnnotations({ intent: "display" });
+        for (const annot of annots) {
+          if (!annot || annot.subtype !== "Widget") continue;
+          const name = annot.fieldName;
+          if (!name || Object.prototype.hasOwnProperty.call(values, name)) continue;
+          const raw = annot.fieldValue != null ? annot.fieldValue : annot.buttonValue;
+          names.push(name);
+          values[name] = stringifyValue(raw);
         }
-      } catch (_) {}
+      }
+      if (!names.length) return null;
+      return { names, values };
+    }
+
+    async function readFields(file) {
+      const data = new Uint8Array(await file.arrayBuffer());
+      const loadingTask = pdfjs.getDocument({
+        data,
+        useSystemFonts: true,
+        isEvalSupported: false,
+      });
+      const doc = await loadingTask.promise;
       try {
-        if (typeof field.isChecked === "function") {
-          return field.isChecked() ? "Yes" : "";
-        }
-      } catch (_) {}
-      try {
-        if (typeof field.getSelected === "function") {
-          const s = field.getSelected();
-          if (Array.isArray(s)) return s.filter(Boolean).join(", ");
-          return s == null ? "" : String(s);
-        }
-      } catch (_) {}
-      return "";
+        const fromObjects = await fieldsFromObjects(doc);
+        if (fromObjects) return fromObjects;
+        return await fieldsFromAnnotations(doc);
+      } finally {
+        try { await doc.destroy(); } catch (_) {}
+      }
     }
 
     function namesKey(names) {
@@ -143,13 +191,11 @@
       const errors = [];
 
       for (const file of files) {
-        let pdf;
+        let extracted;
         try {
-          const bytes = await file.arrayBuffer();
-          pdf = await PDFDocument.load(bytes, { ignoreEncryption: true });
+          extracted = await readFields(file);
         } catch (err) {
-          const m = String(err && err.message ? err.message : err).toLowerCase();
-          if (m.includes("password")) {
+          if (isPasswordError(err)) {
             errors.push(`${file.name} is locked.`);
           } else {
             errors.push(`Couldn't read ${file.name}.`);
@@ -157,20 +203,12 @@
           continue;
         }
 
-        let fields;
-        try {
-          fields = pdf.getForm().getFields();
-        } catch (err) {
+        if (!extracted || !extracted.names.length) {
           errors.push(`${file.name} has no fillable fields.`);
           continue;
         }
 
-        if (!fields.length) {
-          errors.push(`${file.name} has no fillable fields.`);
-          continue;
-        }
-
-        const names = fields.map((f) => f.getName());
+        const names = extracted.names;
         if (!schema) {
           schema = names;
         } else if (namesKey(names) !== namesKey(schema)) {
@@ -178,11 +216,11 @@
           continue;
         }
 
-        const byName = new Map(fields.map((f) => [f.getName(), f]));
         const row = { file: file.name };
         for (const name of schema) {
-          const field = byName.get(name);
-          row[name] = field ? fieldValue(field) : "";
+          row[name] = Object.prototype.hasOwnProperty.call(extracted.values, name)
+            ? extracted.values[name]
+            : "";
         }
         rows.push(row);
       }
